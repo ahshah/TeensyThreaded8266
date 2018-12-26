@@ -1,0 +1,13 @@
+{
+  "name": "TeensyThreadedESP8266",
+  "keywords": "wifi, wi-fi, http, web, server, client",
+  "description": "Threaded ESP8266",
+  "repository":
+  {
+    "type": "git",
+    "url": "https://github.com/ahshah/TeensyThreaded8266.git"
+  },
+  "exclude": "doc",
+  "frameworks": "arduino",
+  "platforms": "atmelavr"
+}
