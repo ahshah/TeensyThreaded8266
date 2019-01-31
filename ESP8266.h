@@ -48,13 +48,13 @@ typedef enum {
 
 typedef struct {
     char rx_data[1024];
-    char tx_data[1024];
+    char* tx_data;
 
     uint16_t rx_len;
+    uint16_t tx_len;
+
     Threads::Mutex lock;
     Threads::Mutex tx_lock;
-
-    uint16_t tx_len;
     cxn_state_t state;
 } connection_t;
 
@@ -69,6 +69,7 @@ class ESP8266 {
     bool SpecialBaud();
     void stateful_tx();
     bool queue(uint8_t mux_id, const uint8_t *buffer, uint32_t len);
+    bool queueAvail(uint8_t mux_id);
     bool setupTransmission(uint8_t mux_id, uint32_t len);
     bool transmit(const char *buffer, uint32_t len);
     void softReset();
@@ -423,7 +424,6 @@ class ESP8266 {
     uint32_t recv(uint8_t mux_id, uint8_t *buffer, uint32_t buffer_size, uint32_t timeout = 1000);
 
     void super_recv();
-    void super_tx();
     bool super_recv_done(recv_msg_t*);
     bool super_recv_mux_done(recv_msg_t* msg);
 

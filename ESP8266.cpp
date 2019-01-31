@@ -19,10 +19,11 @@
  * THE SOFTWARE.
  */
 #include "ESP8266.h"
+#include "ESP8266_private.h"
 #include <string.h>
 
 
-int PIN_RTS = 18;
+int PIN_RTS = 19;
 uint8_t tmpBufIndex;
 char  tmpBuf[32];
 connection_t GConnects[5];
@@ -59,6 +60,7 @@ ESP8266::ESP8266(HardwareSerial &uart, uint32_t baud): m_puart(&uart)
 {
     m_puart->begin(baud);
     rx_empty();
+    memset(&ctx_tx,  0, sizeof(ctx_tx));
 }
 #endif
 
@@ -69,7 +71,8 @@ bool ESP8266::kick(void)
 
 bool ESP8266::restart(void)
 {
-    pinMode(PIN_RTS, INPUT);
+    pinMode(PIN_RTS, OUTPUT);
+    Serial2.attachRts(PIN_RTS);
 
     for (int i =0; i < 5; i++) {
         memset(&(GConnects[i]),  0, sizeof(connection_t));
@@ -303,17 +306,33 @@ bool ESP8266::send(uint8_t mux_id, const uint8_t *buffer, uint32_t len)
 }
 
 
-// Untested and unused
 bool ESP8266::queue(uint8_t mux_id, const uint8_t *buffer, uint32_t len)
 {
     connection_t* cn = &GConnects[mux_id];
     Threads::Scope m(cn->tx_lock);
 
-    if ((sizeof(cn->tx_data)-cn->tx_len) < len) {
+/*    if ((sizeof(cn->tx_data)-cn->tx_len) < len) {
         return false;
     }
     memcpy(cn->tx_data+cn->tx_len, buffer, len);
-    cn->tx_len+=len;
+    */
+
+    if (cn->tx_len != 0) {
+        return false;
+    }
+
+    cn->tx_data = (char*) buffer;
+    cn->tx_len=len;
+    return true;
+}
+
+bool ESP8266::queueAvail(uint8_t mux_id) {
+    connection_t* cn = &GConnects[mux_id];
+    Threads::Scope m(cn->tx_lock);
+
+    if (cn->tx_len != 0) {
+        return false;
+    }
     return true;
 }
 
@@ -632,12 +651,6 @@ bool ESP8266::sATCIPSENDSingle(const uint8_t *buffer, uint32_t len)
 }
 
 bool ESP8266::setupTransmission(uint8_t mux_id, uint32_t len) {
-    int ret = digitalReadFast(PIN_RTS);
-    if (ret) {
-        Console.printf("No console yet..\r\n");
-        return false;
-    }
-
     m_puart->print("AT+CIPSEND=");
     m_puart->print(mux_id);
     m_puart->print(",");
@@ -646,11 +659,6 @@ bool ESP8266::setupTransmission(uint8_t mux_id, uint32_t len) {
 }
 
 bool ESP8266::transmit(const char *buffer, uint32_t len) {
-    int ret = digitalReadFast(PIN_RTS);
-    if (ret) {
-        Console.printf("No console yet for transmit..\r\n");
-        return false;
-    }
     for (uint32_t i = 0; i < len; i++) {
         m_puart->write(buffer[i]);
     }
@@ -659,22 +667,11 @@ bool ESP8266::transmit(const char *buffer, uint32_t len) {
 
 bool ESP8266::sATCIPSENDMultiple(uint8_t mux_id, const uint8_t *buffer, uint32_t len)
 {
-    int ret = digitalReadFast(PIN_RTS);
-    if (ret) {
-        Console.printf("No console yet..\r\n");
-        return false;
-    }
-
     rx_empty();
     m_puart->print("AT+CIPSEND=");
     m_puart->print(mux_id);
     m_puart->print(",");
     m_puart->println(len);
-    ret = digitalReadFast(PIN_RTS);
-    if (ret) {
-        Console.printf("No CTS : not cleared to send yet\r\n");
-        return false;
-    }
 
     bool printed = false;
     char c = 0;
@@ -682,12 +679,6 @@ bool ESP8266::sATCIPSENDMultiple(uint8_t mux_id, const uint8_t *buffer, uint32_t
     tmpBufIndex = 0;
     while(c != '>') {
         count++;
-        ret = digitalReadFast(PIN_RTS);
-        if(!printed && ret) {
-            printed = true;
-            Console.printf("trying to send, but not CTS: not cleared to send.. %d\r\n", ret);
-        }
-
         if (!m_puart->available() && count < 10000) { 
             continue;
         }
@@ -815,47 +806,10 @@ bool ESP8266::sATCIPSTO(uint32_t timeout)
     return recvFind("OK");
 }
 
-typedef enum {
-    NEW_CMD = 0,
-    STATUS,
-    IPD_STATUS,
-    IPD_MUX,
-    IPD_LENGTH,
-    IPD_FRAME
-} recv_state_t;
-
-typedef enum {
-    READY,
-    WAIT_FOR_TRANSMISSION,
-    WAIT_FOR_TRANSMISSION_RESULT,
-    TRANSMISSION_COMPLETE,
-    TRANSMIT
-} tx_state_t;
 
 #define IPD_HEADER "+IPD,"
 #define IPD_HEADER_LEN 5
-typedef struct {
-    char buf[1024];
-    uint16_t iter;
-    uint16_t ipd_length = 0;
-    uint8_t ipd_mux    = 0;
-    uint8_t  ipd_mux_term_index = 0;
-    uint8_t  ipd_header_length = 0;
-    recv_state_t state;
-    recv_msg_t msg;
-} recv_ctx_t;
-recv_ctx_t ctx;
 
-typedef struct {
-    tx_state_t state;
-    uint16_t requested_tx_len;
-    uint8_t mux_id;
-    bool failed;
-    Threads::Mutex lock;
-    char reason[32];
-} tx_ctx_t;
-
-tx_ctx_t ctx_tx;
 
 int recv_state = 0;
 int tx_state = 0;
@@ -945,12 +899,14 @@ void ESP8266::super_recv(void) {
             if (ctx.iter == 2 ) { reset_rx_ctx(); goto done; }
 
             if (ctx.iter ==  9 && 0 == strncmp(ctx.buf, "SEND OK\r\n", 9)) {
+                Console.printf("Transfer complete!\r\n");
                 ctx_tx.lock.lock();
                 ctx_tx.state = TRANSMISSION_COMPLETE;
                 ctx_tx.lock.unlock();
             }
             else if (ctx.iter == 11 && 0 == strncmp(ctx.buf, "SEND FAIL\r\n", 9))
             {
+                Console.printf("Generic transmission failure!\r\n");
                 ctx_tx.lock.lock();
                 ctx_tx.state = TRANSMISSION_COMPLETE;
                 ctx_tx.failed = true;
@@ -958,6 +914,7 @@ void ESP8266::super_recv(void) {
                 ctx_tx.lock.unlock();
             }
             else if (ctx.iter == 12 && 0 == strcmp(ctx.buf, "busy p....")) {
+                Console.printf("Transmission failure, chip busy!\r\n");
                 ctx_tx.lock.lock();
                 ctx_tx.state = TRANSMISSION_COMPLETE;
                 ctx_tx.failed = true;
@@ -965,13 +922,13 @@ void ESP8266::super_recv(void) {
                 ctx_tx.lock.unlock();
             }
 
-
             ctx.buf[ctx.iter] = '\0';
 
             if (ctx.buf[0] != 'A') {
                 *(strstr(ctx.buf, "\r"))=' ';
                 *(strstr(ctx.buf, "\n"))=' ';
-                Console.printf("RX last 0x%x status: [%s]\r\n", ctx.buf[ctx.iter-2], ctx.buf);
+                Console.printf("RX last 0x%x statusLen: [%u]\r\n", ctx.buf[ctx.iter-2], strlen(ctx.buf));
+                Console.printf("   Status: [%s]\r\n", ctx.buf);
                 reset_rx_ctx();
                 break;
             }
@@ -1081,60 +1038,8 @@ done:
 
 
 #define TX_CHUNK_LEN 512
-void ESP8266::super_tx(void) {
-    int ret = digitalReadFast(PIN_RTS);
-    if (ret) {
-        Console.printf("No tx console yet..\r\n");
-        return;
-    }
-    Threads::Scope m(_lock);
-    if (ctx.state != NEW_CMD) {
-        //Console.printf("Reading command, give up on transmission\r\n");
-        return;
-    }
-    else {
-        //Console.printf("Ready for commands\r\n");
-    }
-
-    int len = 0;
-    int remain = 0;
-    bool rc = false;
-    for (int mux_id =0; mux_id < 5; mux_id++) {
-        connection_t* cxn = &GConnects[mux_id];
-        cxn->tx_lock.lock();
-        if (cxn->tx_len <=0) {
-            goto done;
-        }
-        len =  cxn->tx_len < TX_CHUNK_LEN ? cxn->tx_len : TX_CHUNK_LEN;
-
-        rc = digitalReadFast(PIN_RTS);
-        if (rc) {
-            Console.printf("No tx console yet v2..\r\n");
-            goto done;
-        }
-        Console.printf("tx on mux %d with len %u of total %u\r\n", mux_id, len, cxn->tx_len);
-        rc = sATCIPSENDMultiple(mux_id, (uint8_t*)cxn->tx_data, len);
-        remain = cxn->tx_len - len;
-        if (rc) {
-            memmove(cxn->tx_data, cxn->tx_data+len, remain);
-            cxn->tx_len = remain;
-            Console.printf("success TX %d bytes, buffer size: %d!\n", len, sizeof(cxn->tx_data)-cxn->tx_len);
-        }
-done:
-        cxn->tx_lock.unlock();
-    }
-
-}
-
-#define TX_CHUNK_LEN 512
 void ESP8266::stateful_tx(void) {
     tx_iter = (tx_iter + 1) % 16;
-    int ret = digitalReadFast(PIN_RTS);
-    if (ret) {
-        Console.printf("No tx console yet..\r\n");
-        return;
-    }
-
     Threads::Scope m(_lock);
     Threads::Scope m_tx(ctx_tx.lock);
 
@@ -1169,31 +1074,45 @@ void ESP8266::stateful_tx(void) {
                 len = cxn->tx_len < TX_CHUNK_LEN ? cxn->tx_len : TX_CHUNK_LEN;
                 cxn->tx_lock.unlock();
 
+                //Console.printf("*** TX data chunk %d..\n", len);
+
                 ctx_tx.requested_tx_len = len;
                 setupTransmission(mux_id, len);
                 ctx_tx.state = WAIT_FOR_TRANSMISSION;
                 break;
 
             case TRANSMIT:
-                //Console.printf("SUCCESS TX Setup!");
                 cxn->tx_lock.lock();
-                transmit(cxn->tx_data, ctx_tx.requested_tx_len);
+                Console.printf("*** Attempt TX with offset %d!\r\n", ctx_tx.wrote);
+                if (!transmit(cxn->tx_data+ctx_tx.wrote, ctx_tx.requested_tx_len)) {
+                    cxn->tx_lock.unlock();
+                    break;
+                }
                 cxn->tx_lock.unlock();
                 ctx_tx.state = WAIT_FOR_TRANSMISSION_RESULT;
+                Console.printf("*** Attempt TX with offset %d complete, now wait!\r\n", ctx_tx.wrote);
                 break;
 
             case TRANSMISSION_COMPLETE:
                 if (ctx_tx.failed) {
-                    Console.printf("FAILED TX %d bytes, reason: %s\n", ctx_tx.requested_tx_len, ctx_tx.reason);
+                    Console.printf("FAILED TX %d bytes, reason: %s\r\n", ctx_tx.requested_tx_len, ctx_tx.reason);
                 }
 
                 cxn->tx_lock.lock();
                 remain = cxn->tx_len - ctx_tx.requested_tx_len;
-                memmove(cxn->tx_data, cxn->tx_data+ctx_tx.requested_tx_len, remain);
+                ctx_tx.wrote += ctx_tx.requested_tx_len;
+
+                //Console.printf("*** Moving %d bytes of data offset from..%d\n", remain, ctx_tx.requested_tx_len);
+                //memmove(cxn->tx_data, cxn->tx_data+ctx_tx.requested_tx_len, remain);
                 cxn->tx_len = remain;
+                if (remain == 0) {
+                    //Console.printf("*** Freeing data..\n");
+                    ctx_tx.wrote = 0;
+                    //free(cxn->tx_data);
+                }
                 cxn->tx_lock.unlock();
 
-                //Console.printf("success TX %d bytes, buffer size: %d!\n", ctx_tx.requested_tx_len, sizeof(cxn->tx_data)-cxn->tx_len);
+                //Console.printf("success TX %d bytes, buffer size: %d!\n", ctx_tx.requested_tx_len, cxn->tx_len);
                 reset_tx_ctx();
                 break;
 
