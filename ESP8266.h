@@ -46,6 +46,13 @@ typedef enum {
     OPEN
 } cxn_state_t;
 
+typedef enum {
+    QUEUED      = 0,
+    SENT        = 1,
+    COMPLETE    = 2,
+    FAILED      = 3,
+} seg_state_t;
+
 typedef struct {
     char rx_data[1024];
     char* tx_data;
@@ -56,9 +63,8 @@ typedef struct {
     Threads::Mutex lock;
     Threads::Mutex tx_lock;
     cxn_state_t state;
+    seg_state_t seg_state;
 } connection_t;
-
-
 
 /**
  * Provide an easy-to-use way to manipulate ESP8266. 
@@ -441,7 +447,8 @@ class ESP8266 {
      */
     uint32_t recv(uint8_t *coming_mux_id, uint8_t *buffer, uint32_t buffer_size, uint32_t timeout = 1000);
 
-    String runCommand(const String& cmd);
+    String runCommand(const char* cmd);
+    seg_state_t getTransferState(uint8_t mux);
 
  private:
       Threads::Mutex _lock;
@@ -515,7 +522,7 @@ class ESP8266 {
     bool sATCIPMUX(uint8_t mode);
     bool sATCIPSERVER(uint8_t mode, uint32_t port = 333);
     bool sATCIPSTO(uint32_t timeout);
-    
+
     /*
      * +IPD,len:data
      * +IPD,id,len:data

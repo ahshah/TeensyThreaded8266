@@ -1,6 +1,8 @@
 #ifndef ESP8266_PRIVATE
 #define ESP8266_PRIVATE
 
+#define MAX_MUX 5
+
 typedef enum {
     NEW_CMD = 0,
     STATUS,
@@ -34,11 +36,11 @@ typedef struct {
     tx_state_t state;
     uint16_t requested_tx_len;
     uint16_t wrote;
+    uint32_t last_write;
     uint8_t mux_id;
     bool failed;
     Threads::Mutex lock;
     char reason[32];
 } tx_ctx_t;
-
 tx_ctx_t ctx_tx;
 #endif

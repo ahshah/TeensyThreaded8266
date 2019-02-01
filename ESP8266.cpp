@@ -26,7 +26,7 @@
 int PIN_RTS = 19;
 uint8_t tmpBufIndex;
 char  tmpBuf[32];
-connection_t GConnects[5];
+connection_t GConnects[MAX_MUX];
 
 #define LOG_OUTPUT_DEBUG            (0)
 #define LOG_OUTPUT_DEBUG_PREFIX     (0)
@@ -311,19 +311,20 @@ bool ESP8266::queue(uint8_t mux_id, const uint8_t *buffer, uint32_t len)
     connection_t* cn = &GConnects[mux_id];
     Threads::Scope m(cn->tx_lock);
 
-/*    if ((sizeof(cn->tx_data)-cn->tx_len) < len) {
-        return false;
-    }
-    memcpy(cn->tx_data+cn->tx_len, buffer, len);
-    */
-
     if (cn->tx_len != 0) {
         return false;
     }
 
     cn->tx_data = (char*) buffer;
     cn->tx_len=len;
+    cn->seg_state = QUEUED;
     return true;
+}
+
+seg_state_t ESP8266::getTransferState(uint8_t mux) {
+    connection_t* cn = &GConnects[mux];
+    Threads::Scope m(cn->tx_lock);
+    return cn->seg_state;
 }
 
 bool ESP8266::queueAvail(uint8_t mux_id) {
@@ -673,7 +674,6 @@ bool ESP8266::sATCIPSENDMultiple(uint8_t mux_id, const uint8_t *buffer, uint32_t
     m_puart->print(",");
     m_puart->println(len);
 
-    bool printed = false;
     char c = 0;
     int count = 0;
     tmpBufIndex = 0;
@@ -828,10 +828,18 @@ void reset_rx_ctx() {
 void reset_tx_ctx() {
     ctx_tx.state = READY;
     ctx_tx.requested_tx_len = 0;
-    ctx_tx.mux_id = 0;
-    ctx_tx.failed = false;
+     ctx_tx.failed = false;
+   ctx_tx.mux_id = 0;
     ctx_tx.reason[0] = '\0';
     //memset(ctx_tx.reason, 0, sizeof(ctx_tx.reason));
+}
+
+void reset_tx_ctx_failed(uint8_t mux) {
+    ctx_tx.failed = ctx_tx.failed ^ (1 << mux);
+}
+
+void set_tx_ctx_failed(uint8_t mux) {
+    ctx_tx.failed = ctx_tx.failed | (1 << mux);
 }
 
 void ESP8266::softReset() {
@@ -1084,6 +1092,9 @@ void ESP8266::stateful_tx(void) {
             case TRANSMIT:
                 cxn->tx_lock.lock();
                 Console.printf("*** Attempt TX with offset %d!\r\n", ctx_tx.wrote);
+                if (ctx_tx.last_write != 0 || millis()+20 > ctx_tx.last_write ) {
+                    threads.yield();
+                }
                 if (!transmit(cxn->tx_data+ctx_tx.wrote, ctx_tx.requested_tx_len)) {
                     cxn->tx_lock.unlock();
                     break;
@@ -1094,11 +1105,14 @@ void ESP8266::stateful_tx(void) {
                 break;
 
             case TRANSMISSION_COMPLETE:
+                cxn->tx_lock.lock();
+
+                cxn->seg_state = COMPLETE;
                 if (ctx_tx.failed) {
                     Console.printf("FAILED TX %d bytes, reason: %s\r\n", ctx_tx.requested_tx_len, ctx_tx.reason);
+                    cxn->seg_state = FAILED;
                 }
 
-                cxn->tx_lock.lock();
                 remain = cxn->tx_len - ctx_tx.requested_tx_len;
                 ctx_tx.wrote += ctx_tx.requested_tx_len;
 
@@ -1131,7 +1145,6 @@ void ESP8266::stateful_tx(void) {
            break;
         }
     }
-
     tx_state = ctx_tx.state;
 }
 
@@ -1187,7 +1200,7 @@ bool ESP8266::super_recv_mux_done(recv_msg_t* msg) {
     return ret;
 }
 
-String ESP8266::runCommand(const String& cmd) {
+String ESP8266::runCommand(const char* cmd) {
     unsigned long start = millis();
 
     while (millis() - start < 5000) {
@@ -1198,7 +1211,7 @@ String ESP8266::runCommand(const String& cmd) {
         _lock.unlock();
     }
 
-    m_puart->println(cmd.c_str());
+    m_puart->println(cmd);
     String ret = recvString("OK\r\n");
 
     _lock.unlock();
